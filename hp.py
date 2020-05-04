@@ -30,6 +30,6 @@ print('found', len(confs), 'configs')
 for i in range(30):
     c = confs[random.randint(0,len(confs)-1)]
     print(c)
-    with open('run_%d.sh' % i, 'w') as f:
+    with open('scripts/run_%d.sh' % i, 'w') as f:
         f.write('#!/bin/bash\n')
-        f.write('python run_irm.py -lr {learning_rate} -n {nb_units} -b {batch_size} -e {epochs} -w {warmup_epochs} -l {lambda_multiplier}\n'.format(**c))
+        f.write('PYTHONPATH=.. python ../run_irm.py -lr {learning_rate} -n {nb_units} -b {batch_size} -e {epochs} -w {warmup_epochs} -l {lambda_multiplier}\n'.format(**c))
