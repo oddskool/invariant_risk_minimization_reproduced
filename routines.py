@@ -50,6 +50,11 @@ class ColoredMNISTEnvironments():
                                     self.original_data['y_train'][k:2*k], .2)
         self.e3 = self.__create_env(self.original_data['x_train'][2*k:3*k], 
                                     self.original_data['y_train'][2*k:3*k], .9)
+        x, y = self.__create_env(self.original_data['x_train'][2*k:3*k], 
+                                 self.original_data['y_train'][2*k:3*k], .9, return_tf_data=False)
+        x[:, :, :, 1] = x[:, :, :, 0]
+        x[:, :, :, 2] = x[:, :, :, 0]
+        self.e3_greyscale = tf.data.Dataset.from_tensor_slices((x, y))
         
     def __create_validation_envs(self):
         k=10**4
@@ -61,7 +66,14 @@ class ColoredMNISTEnvironments():
         self.e33 = self.__create_env(self.original_data['x_train'][i+2*k:i+3*k], 
                                      self.original_data['y_train'][i+2*k:i+3*k], .9)
         
-    def __create_env(self, x, y, e, labelflip_proba=.25):
+        x, y = self.__create_env(self.original_data['x_train'][i+2*k:i+3*k], 
+                                     self.original_data['y_train'][i+2*k:i+3*k], .9, return_tf_data=False)
+        x[:, :, :, 1] = x[:, :, :, 0]
+        x[:, :, :, 2] = x[:, :, :, 0]
+        self.e33_greyscale = tf.data.Dataset.from_tensor_slices((x, y))
+        
+        
+    def __create_env(self, x, y, e, labelflip_proba=.25, return_tf_data=True):
         x = x.copy()
         y = y.copy()
 
@@ -77,7 +89,9 @@ class ColoredMNISTEnvironments():
 
         x[color, :, :, 2] = 0
         x[color, :, :, 1] = 0
-        return tf.data.Dataset.from_tensor_slices((x, y))
+        if return_tf_data:
+            return tf.data.Dataset.from_tensor_slices((x, y))
+        return x, y
 
                                                   
 def get_model(args):
@@ -136,7 +150,6 @@ class IRMModel(object):
         self.model = model
         self.optimizer = optimizer
         self.envs = ColoredMNISTEnvironments()
-#         self.dummy = tf.convert_to_tensor([1.])
         self.loss = tf.keras.losses.BinaryCrossentropy(from_logits=True)
         self.logs = defaultdict(list)
         self.logdir = "/home/e.diemert/tflogs/scalars/" + \
@@ -152,39 +165,22 @@ class IRMModel(object):
         loss = tf.keras.metrics.BinaryCrossentropy()
         per_batch_penalties = []
         for (batch, (x, y)) in enumerate(env):
-            dummy = tf.convert_to_tensor([1.])
-            with tf.GradientTape() as tape:
-                tape.watch(dummy)
-                logits = self.model(x, training=False)
-                dummy_loss = self.loss(y, logits) * dummy
-            batch_grads = tape.gradient(dummy_loss, [dummy])
-            per_batch_penalties += [
-                tf.math.reduce_sum(tf.math.square(
-                    dummy_loss * batch_grads
-                ))
-            ]
+            dummy_loss, dummy_penalty = self.compute_penalty(x,y,training=False)
+            per_batch_penalties += [dummy_penalty]
+            logits = self.model(x, training=False)
             loss.update_state(y, logits)
             accuracy.update_state(y, tf.math.greater(tf.keras.activations.sigmoid(logits), .5))
-        return loss.result().numpy(), accuracy.result().numpy(), tf.reduce_mean(per_batch_penalties)
+        return loss.result().numpy(), accuracy.result().numpy(), tf.reduce_mean(per_batch_penalties).numpy()
     
-    def compute_penalty(self, x, y):
+    def compute_penalty(self, x, y, training=True):
         dummy = tf.convert_to_tensor([1.])
         with tf.GradientTape() as tape:
             tape.watch(dummy)
-            dummy_logits = self.model(x, training=True)
+            dummy_logits = self.model(x, training=training)
             dummy_loss = self.loss(y, dummy_logits * dummy)
         dummy_grads = tape.gradient(dummy_loss, dummy)
         dummy_penalty = tf.math.reduce_sum(dummy_grads ** 2)
         return dummy_loss, dummy_penalty
-        
-    def batch_gradients(self, x, y, penalty, gradclip=1.0):
-        with tf.GradientTape() as tape:
-            tape.watch(penalty)
-            logits = self.model(x, training=True)
-            loss_value = self.loss(y, logits) + penalty
-        grads = tape.gradient(loss_value, self.model.trainable_variables)
-        #grads = tf.clip_by_value(grads, -1, 1)
-        return loss_value, grads
     
     def compute_gradients(self, x_s, y_s, lambda_=1, gradclip=1.0, batch=0, epoch=0):
         # compute penalty
@@ -195,13 +191,13 @@ class IRMModel(object):
             dummy_losses = [self.loss(y_s[i], dummy * dummy_logits[i]) for i in range(len(x_s))]
             dummy_loss = tf.reduce_mean(dummy_losses)
         dummy_grads = tape.gradient(dummy_loss, dummy)
-        self.report_grad_norms(dummy_grads, 'grad-pen-', batch, epoch)
+        self.report_grad_norms(dummy_loss, dummy_grads, 'dummy-', batch, epoch)
         penalty = tf.reduce_sum(dummy_grads ** 2)
         # compute model gradients
         with tf.GradientTape() as tape:
             logits = [self.model(x_s[i], training=True) for i in range(len(x_s))]
-            losses = [self.loss(y_s[i], logits[i]) + lambda_*penalty for i in range(len(x_s))]
-            total_loss = tf.reduce_mean(losses)
+            losses = [self.loss(y_s[i], logits[i]) + tf.convert_to_tensor(lambda_) * penalty for i in range(len(x_s))]
+            total_loss = tf.reduce_mean(losses) / tf.convert_to_tensor(lambda_)
         total_grads = tape.gradient(total_loss, self.model.trainable_variables)
 #         total_grads = tf.clip_by_global_norm([total_grads], 100)
         return total_loss, total_grads
@@ -210,23 +206,17 @@ class IRMModel(object):
         if print_:
             print('-'*80)
             print("epoch:", epoch)
-        ood_loss, ood_acc, ood_penalty = self.evaluate(self.envs.e3.shuffle(2*batch_size).batch(batch_size))
-        self.logs['ood-loss'] += [ood_loss]
-        self.logs['ood-acc'] += [ood_acc]
-        self.logs['ood-penalty'] += [ood_penalty.numpy()]
-        self.log_event('ood_loss', ood_loss, epoch)
-        self.log_event('ood_acc', ood_acc, epoch)
-        self.log_event('ood_pen', ood_penalty.numpy(), epoch)
-        if print_:
-            print('ood loss %.5f acc: %.3f'%(ood_loss, ood_acc))   
-        for env_name, env in (('e11',self.envs.e11.shuffle(2*batch_size).batch(batch_size)), 
-                              ('e22',self.envs.e22.shuffle(2*batch_size).batch(batch_size)),):
-            env_loss, env_acc, env_penalty = self.evaluate(env)
-            self.logs[env_name+'-test-loss'] += [env_loss]
-            self.logs[env_name+'-test-acc'] += [env_acc]
+        for env_name, env in (('e10',self.envs.e1), 
+                              ('e11',self.envs.e11), 
+                              ('e20',self.envs.e2),
+                              ('e22',self.envs.e22),
+                              ('e30',self.envs.e3),
+                              ('e33',self.envs.e33),
+                              ('egs',self.envs.e33_greyscale)):
+            env_loss, env_acc, env_penalty = self.evaluate(env.shuffle(2*batch_size).batch(batch_size))
             self.log_event(env_name+'_loss', env_loss, epoch)
             self.log_event(env_name+'_acc', env_acc, epoch)
-            self.log_event(env_name+'_pen', env_penalty.numpy(), epoch)
+            self.log_event(env_name+'_pen', env_penalty, epoch)
             if print_:
                 print('%s loss %.5f acc: %.3f'%(env_name, env_loss, env_acc))
         if print_:
@@ -234,15 +224,19 @@ class IRMModel(object):
 
     def log_event(self, event, value, epoch):
         tf.summary.scalar(event, data=value, step=epoch)
+        self.logs[event] += [value]
         
     def grad_norm(self, grad):
         return tf.math.sqrt(tf.reduce_sum(tf.math.square(grad)))
     
-    def report_grad_norms(self, grads, name, batch, epoch):
+    def report_grad_norms(self, loss, grads, name, batch, epoch):
+        self.log_event(name+'loss', loss.numpy(), epoch)
+        total_grad_norm = tf.reduce_sum([self.grad_norm(grad).numpy()for grad in grads])
+        self.log_event(name+'grad', total_grad_norm.numpy(), epoch)
         for layer, grad in enumerate(grads):
-            self.log_event(name + 'layer%d'%layer, self.grad_norm(grad).numpy(), epoch*10000+batch)
+            self.log_event(name + 'grad-layer%d'%layer, self.grad_norm(grad).numpy(), epoch)
                 
-    def train(self, epochs, lambda_, batch_size=128, print_=False):
+    def train(self, epochs, lambda_, batch_size=128, print_=False, eval_every=1):
         for epoch in range(epochs):
             d1 = self.envs.e1.shuffle(2*batch_size).batch(batch_size).__iter__()
             d2 = self.envs.e2.shuffle(2*batch_size).batch(batch_size).__iter__()
@@ -251,12 +245,15 @@ class IRMModel(object):
                 try:
                     x1, y1 = d1.next()
                     x2, y2 = d2.next()
-                    total_loss, total_grads = self.compute_gradients([x1, x2], [y1, y2], lambda_=lambda_(epoch), 
-                                                                    batch=batch, epoch=epoch)
-                    if batch == 0:
-                        self.report_grad_norms(total_grads, 'grad-', batch, epoch)
+                    total_loss, total_grads = self.compute_gradients(
+                        [x1, x2], [y1, y2],
+                        lambda_=lambda_(epoch), batch=batch, epoch=epoch
+                    )
+                    self.report_grad_norms(total_loss, total_grads, 'total-', batch, epoch)
                     self.optimizer.apply_gradients(zip(total_grads, self.model.trainable_variables))
                     batch += 1
                 except StopIteration:
                     break
-            self.do_evaluations(epoch, batch_size=batch_size, print_=print_)
+            if epoch % eval_every == 0:
+                self.do_evaluations(epoch, batch_size=batch_size, print_=print_)
+        self.do_evaluations(epoch, batch_size=batch_size, print_=print_)

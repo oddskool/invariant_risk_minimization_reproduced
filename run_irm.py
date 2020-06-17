@@ -15,6 +15,7 @@ parser.add_argument("--lambda-multiplier", '-l', type=float, default=10000)
 parser.add_argument("--l2-reg", '-l2', type=float, default=0)
 parser.add_argument("--mlp", '-m', default=False, action='store_true')
 parser.add_argument("--verbose", '-v', default=False, action='store_true')
+parser.add_argument("--eval-every", '-ee', default=1, type=int)
 
 def get_results(args):
     
@@ -26,10 +27,11 @@ def get_results(args):
     def run_once():
         irm = IRMModel(
             model = get_model(args),
-            optimizer = tf.keras.optimizers.Adam(learning_rate=args.learning_rate)
+            optimizer = tf.keras.optimizers.Adam(learning_rate=args.learning_rate)#, clipnorm=1, decay=0)
         )
-        irm.train(args.epochs, lambda_scheduler, batch_size=args.batch_size, print_=args.verbose)
-        acc = irm.logs['ood-acc'][-1]
+        irm.train(args.epochs, lambda_scheduler, batch_size=args.batch_size, 
+                  print_=args.verbose, eval_every=args.eval_every)
+        acc = irm.logs['e33_acc'][-1]
         return acc, irm.logdir
     
     results = [run_once() for _ in range(args.repeats)]
