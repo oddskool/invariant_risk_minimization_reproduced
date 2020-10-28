@@ -31,8 +31,8 @@ def random_parameters_tuning(args):
 
     params = {
        'learning_rate': [1e-3, 1e-4, 1e-5, 1e-6],
-        'nb_units': [16, 32, 64, 128],
-        'nb_layers': [3, 5, 7, 10],
+        'nb_units': [64, 128, 256, 512],
+        'nb_layers': [2, 3, 5, 7],
         'mlp': [True, True, True, True, False],
         'epochs': [50, 100, 200, 500, 700],
         'warmup_epochs': [10, 50, 100, 200],
@@ -56,20 +56,21 @@ def get_results(args, envs=None):
             return 1
         return args.lambda_multiplier #* epoch**4
     
-    def run_once():
+    def run_once(seed=None):
+        if seed is not None:
+            tf.random.set_seed(seed)
         irm = IRMModel(
             model=get_model(args),
-            optimizer=tf.keras.optimizers.Adam(learning_rate=args.learning_rate, clipvalue=1),
+            optimizer=tf.keras.optimizers.Adam(learning_rate=args.learning_rate),
             # optimizer=tf.keras.optimizers.SGD(learning_rate=args.learning_rate),
             envs=envs
         )
         irm.train(args.epochs, lambda_scheduler,
-                  #batch_size=args.batch_size,
                   print_=args.verbose, eval_every=args.eval_every)
         acc = irm.logs['e33_acc'][-1]
         return acc, irm.logdir
     
-    results = [run_once() for _ in range(args.repeats)]
+    results = [run_once(42*_) for _ in range(args.repeats)]
     return [r[0] for r in results], [r[1] for r in results]
 
 

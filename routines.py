@@ -163,6 +163,12 @@ class IRMModel(object):
         self.file_writer = tf.summary.create_file_writer(self.logdir + "/metrics")
         self.file_writer.set_as_default()
 
+        d1 = [_ for _ in self.envs.e1]
+        d2 = [_ for _ in self.envs.e2]
+        self.x1, self.y1 = tf.convert_to_tensor([_[0] for _ in d1]), tf.convert_to_tensor([_[1] for _ in d1])
+        self.x2, self.y2 = tf.convert_to_tensor([_[0] for _ in d2]), tf.convert_to_tensor([_[1] for _ in d2])
+
+
     def evaluate(self, env):
         d = [_ for _ in env]
         x, y = tf.convert_to_tensor([_[0] for _ in d]), tf.convert_to_tensor([_[1] for _ in d])
@@ -175,7 +181,11 @@ class IRMModel(object):
         accuracy.update_state(y, tf.math.greater(tf.keras.activations.sigmoid(logits), .5))
         return loss.result().numpy(), accuracy.result().numpy(), dummy_penalty.numpy()
 
-    def compute_penalty(self, x, y, training=True):
+    def compute_penalty(self, x=None, y=None, training=True):
+        if x is None:
+            loss_1, pen_1 = self.compute_penalty(self.x1, self.y1)
+            loss_2, pen_2 = self.compute_penalty(self.x2, self.y2)
+            return tf.reduce_mean([loss_1, loss_2]), tf.reduce_mean([pen_1, pen_2])
         with tf.GradientTape() as tape:
             _, dummy_logits = self.model(x, training=training)
             dummy_loss = self.dummy_loss(y, dummy_logits)
@@ -183,7 +193,8 @@ class IRMModel(object):
         dummy_grads = tape.gradient(dummy_loss, self.model.trainable_variables)
         dummy_penalty = [
             tf.reduce_sum(g)
-            for g, v in zip(dummy_grads, self.model.trainable_variables) if 'dummy/kernel' in v.name
+            for g, v in zip(dummy_grads, self.model.trainable_variables)
+            if 'dummy' in v.name and 'kernel' in v.name
         ]
         assert len(dummy_penalty) == 1
         dummy_penalty = dummy_penalty[0]**2
@@ -193,10 +204,11 @@ class IRMModel(object):
     def compute_gradients(self, x, y, lambda_=1, use_loss=True):
         # compute model gradients
         with tf.GradientTape() as tape:
-            _, penalty = self.compute_penalty(x, y)
+            _, penalty = self.compute_penalty()
             logits, _ = self.model(x, training=True)
             if use_loss:
                 loss = self.loss(y, logits) + lambda_ * penalty
+                if lambda_ > 1:
             else:
                 loss = lambda_ * penalty
             # loss = (
@@ -249,45 +261,50 @@ class IRMModel(object):
             self.log_event(name + 'weight-layer%d' % i, self.grad_norm(layer.get_weights()[0]).numpy(), epoch)
 
     def train(self, epochs, lambda_, print_=False, eval_every=10):
-        d1 = [_ for _ in self.envs.e1]
-        d2 = [_ for _ in self.envs.e2]
-        x1, y1 = tf.convert_to_tensor([_[0] for _ in d1]), tf.convert_to_tensor([_[1] for _ in d1])
-        x2, y2 = tf.convert_to_tensor([_[0] for _ in d2]), tf.convert_to_tensor([_[1] for _ in d2])
-        for epoch in range(epochs):
-            for envname, x, y in (('e1', x1, y1), ('e2', x2, y2)):
+        self.do_evaluations(0, lambda_=lambda_(0), print_=print_)
+        for epoch in range(1, epochs+1):
+            total_gradients = []
+            for envname, x, y in (('e1', self.x1, self.y1), ('e2', self.x2, self.y2)):
                 loss, gradients = self.compute_gradients(x, y, lambda_=lambda_(epoch))#, use_loss=lambda_(epoch)<=1)
                 # nullify gradients of dummy variable
                 gradients = [grad if 'dummy' not in var.name else 0*grad for grad, var in zip(gradients, self.model.trainable_variables)]
                 for grad, var in zip(gradients, self.model.trainable_variables):
                     if 'dummy' in var.name:
                         assert tf.reduce_sum(grad).numpy() == 0
-                self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
                 self.report_grad_norms(loss, gradients, envname, epoch)
+                total_gradients += [gradients]
+            averaged_gradients = []
+            for g, gg in zip(total_gradients[0], total_gradients[1]):
+                assert g.shape == gg.shape, (g.shape, gg.shape)
+                avg_grad = tf.reduce_mean([g,gg], axis=0)
+                assert avg_grad.shape == g.shape, (avg_grad.shape, g.shape)
+                averaged_gradients += [avg_grad]
+            self.optimizer.apply_gradients(zip(averaged_gradients, self.model.trainable_variables))
             if epoch % eval_every == 0:
                 self.do_evaluations(epoch, lambda_=lambda_(epoch), print_=print_)
         self.do_evaluations(epochs, lambda_=lambda_(epoch), print_=print_)
 
-    def train_batch(self, epochs, lambda_, batch_size=128, print_=False, eval_every=1):
-        for epoch in range(epochs):
-            d1 = self.envs.e1.shuffle(2 * batch_size).batch(batch_size).__iter__()
-            d2 = self.envs.e2.shuffle(2 * batch_size).batch(batch_size).__iter__()
-            batch = 0
-            while True:
-                try:
-                    x1, y1 = d1.next()
-                    x2, y2 = d2.next()
-                    total_loss, total_grads = self.compute_gradients(
-                        [x1, x2], [y1, y2],
-                        lambda_=lambda_(epoch), batch=batch, epoch=epoch
-                    )
-                    for grads in total_grads:
-                        self.report_grad_norms(total_loss, grads, 'total-',
-                                               batch, epoch, report_weight=True)
-                    for grads in total_grads:
-                        self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
-                    batch += 1
-                except StopIteration:
-                    break
-            if epoch % eval_every == 0:
-                self.do_evaluations(epoch, batch_size=batch_size, print_=print_)
-        self.do_evaluations(epochs, batch_size=batch_size, print_=print_)
+    # def train_batch(self, epochs, lambda_, batch_size=128, print_=False, eval_every=1):
+    #     for epoch in range(epochs):
+    #         d1 = self.envs.e1.shuffle(2 * batch_size).batch(batch_size).__iter__()
+    #         d2 = self.envs.e2.shuffle(2 * batch_size).batch(batch_size).__iter__()
+    #         batch = 0
+    #         while True:
+    #             try:
+    #                 x1, y1 = d1.next()
+    #                 x2, y2 = d2.next()
+    #                 total_loss, total_grads = self.compute_gradients(
+    #                     [x1, x2], [y1, y2],
+    #                     lambda_=lambda_(epoch), batch=batch, epoch=epoch
+    #                 )
+    #                 for grads in total_grads:
+    #                     self.report_grad_norms(total_loss, grads, 'total-',
+    #                                            batch, epoch, report_weight=True)
+    #                 for grads in total_grads:
+    #                     self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+    #                 batch += 1
+    #             except StopIteration:
+    #                 break
+    #         if epoch % eval_every == 0:
+    #             self.do_evaluations(epoch, batch_size=batch_size, print_=print_)
+    #     self.do_evaluations(epochs, batch_size=batch_size, print_=print_)
